@@ -1,11 +1,3 @@
-"""Configuration management for the algo trading bot.
-
-Resolution order for every setting:
-    1. Real environment variable
-    2. Value from the ``.env`` file (loaded without overriding real env vars)
-    3. ``FallbackConfig`` default
-"""
-
 from __future__ import annotations
 
 import os
@@ -46,6 +38,8 @@ class FallbackConfig:
     nifty100_constituents_url: str = (
         "https://archives.nseindia.com/content/indices/ind_nifty100list.csv"
     )
+    redirect_url: str = "http://127.0.0.1:5000/"
+    login_timeout_seconds: int = 300
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -86,6 +80,9 @@ class AppConfig:
     quote_batch_size: int
     http_timeout_seconds: int
     nifty100_constituents_url: str
+    redirect_url: str
+    login_timeout_seconds: int
+    token_file: Path
 
     # ------------------------------------------------------------------ #
     @classmethod
@@ -119,7 +116,7 @@ class AppConfig:
         token_file = _resolve_path(_env("ACCESS_TOKEN_FILE", fb.access_token_file))
 
         return cls(
-            credentials=cls._load_credentials(token_file, tz),
+            credentials=cls._load_credentials(token_file),
             timezone=tz,
             morning_setup_time=setup_t,
             market_open_time=open_t,
@@ -139,25 +136,19 @@ class AppConfig:
             nifty100_constituents_url=_env(
                 "NIFTY100_CONSTITUENTS_URL", fb.nifty100_constituents_url
             ),
+            redirect_url=_env("KITE_REDIRECT_URL", fb.redirect_url),
+            login_timeout_seconds=_env_int("LOGIN_TIMEOUT_SECONDS", fb.login_timeout_seconds),
+            token_file=token_file,
         )
 
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _load_credentials(token_file: Path, tz: ZoneInfo) -> KiteCredentials:
+    def _load_credentials(token_file: Path) -> KiteCredentials:
         api_key = _env("KITE_API_KEY", "")
         api_secret = _env("KITE_API_SECRET", "")
         if not api_key:
             raise ConfigError("KITE_API_KEY is not set (env var or .env file).")
-        if not api_secret:
-            logger.warning("KITE_API_SECRET is not set; fine for trading, required only for login.")
-
-        access_token = _read_access_token(token_file, tz)
-        if not access_token:
-            raise ConfigError(
-                "No access token found. Set KITE_ACCESS_TOKEN / ACCESS_TOKEN, "
-                f"or run login.py to create {token_file.name}."
-            )
-        return KiteCredentials(api_key, api_secret, access_token)
+        return KiteCredentials(api_key, api_secret, _read_access_token(token_file))
 
 
 # ---------------------------------------------------------------------- #
@@ -200,12 +191,16 @@ def _resolve_path(value: str) -> Path:
     return path if path.is_absolute() else BASE_DIR / path
 
 
-def _read_access_token(token_file: Path, tz: ZoneInfo) -> str:
-    """Env var first, then the token file written by the login script."""
+def _read_access_token(token_file: Path) -> str:
+    """Env var first, then the token file. Returns '' if neither exists."""
     for var in ("KITE_ACCESS_TOKEN", "ACCESS_TOKEN"):
         value = os.environ.get(var, "").strip()
         if value:
             return value
+    if token_file.is_file():
+        return token_file.read_text(encoding="utf-8").strip()
+    return ""
+    
 
     if token_file.is_file():
         token = token_file.read_text(encoding="utf-8").strip()

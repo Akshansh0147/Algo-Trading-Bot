@@ -26,6 +26,7 @@ from config import AppConfig, ConfigError
 from market_data import AuthenticationError, MarketDataError, MarketDataManager
 from strategies.base_strategy import BaseStrategy
 from strategies.strategy_sample import GapUpBreakoutStrategy
+from auth import ensure_authenticated
 
 _LOG_FORMAT = (
     "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | "
@@ -190,7 +191,7 @@ class TradingBot:
 # ---------------------------------------------------------------------- #
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Automated algo trading bot (paper trading)")
-    parser.add_argument("--run-once", choices=["morning", "open", "close"], help="run one job immediately and exit")
+        parser.add_argument("--force-login", action="store_true", help="ignore the saved token and log in again")
     return parser.parse_args(argv)
 
 
@@ -204,6 +205,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     setup_logging(config)
     try:
+        config = ensure_authenticated(config, force_login=args.force_login)
         bot = TradingBot(config)
         if args.run_once:
             bot.run_once(args.run_once)
