@@ -1,100 +1,225 @@
-"""Authenticate with Kite Connect and save today's access token."""
+"""Entry point: scheduling and orchestration of the trading bot.
 
-import os
-import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+Usage:
+    python main.py                      # run the scheduler (blocking)
+    python main.py --run-once morning   # test a single job right now
+    python main.py --run-once open
+    python main.py --run-once close
+"""
 
-from kiteconnect import KiteConnect
+from __future__ import annotations
+
+import argparse
+import signal
+import sys
+from collections.abc import Callable, Sequence
+from datetime import datetime, time
+from types import FrameType
+from typing import Any
+
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED, JobExecutionEvent
+from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.cron import CronTrigger
+from loguru import logger
+
+from config import AppConfig, ConfigError
+from market_data import AuthenticationError, MarketDataError, MarketDataManager
+from strategies.base_strategy import BaseStrategy
+from strategies.strategy_sample import GapUpBreakoutStrategy
+
+_LOG_FORMAT = (
+    "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | "
+    "<cyan>{extra[strategy]}</cyan> | {name}:{function}:{line} - <level>{message}</level>"
+)
 
 
-def load_env_file(path: Path) -> None:
-    if not path.exists():
-        return
+def setup_logging(config: AppConfig) -> None:
+    config.log_dir.mkdir(parents=True, exist_ok=True)
+    logger.remove()
+    logger.configure(extra={"strategy": "-"})
+    logger.add(sys.stderr, level=config.log_level, format=_LOG_FORMAT, colorize=True)
+    logger.add(
+        config.log_dir / "bot_{time:YYYY-MM-DD}.log",
+        level=config.log_level,
+        format=_LOG_FORMAT.replace("<green>", "").replace("</green>", "")
+        .replace("<cyan>", "").replace("</cyan>", "")
+        .replace("<level>", "").replace("</level>", ""),
+        rotation="00:00",
+        retention="14 days",
+        encoding="utf-8",
+        enqueue=True,  # safe with the websocket thread
+    )
 
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        name, value = line.split("=", 1)
-        value = value.strip().strip('"').strip("'")
-        os.environ.setdefault(name.strip(), value)
 
+class TradingBot:
+    """Wires the scheduler, market data manager and strategies together."""
 
-class RequestTokenHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        callback = self.server.callback
-        parsed = urlparse(self.path)
-        if parsed.path != callback.path:
-            self.send_error(404)
+    def __init__(self, config: AppConfig) -> None:
+        self._config = config
+        self._market_data = MarketDataManager(config)
+        self._scheduler = BlockingScheduler(timezone=config.timezone)
+        self._strategies: list[BaseStrategy] = [
+            GapUpBreakoutStrategy(self._market_data, capital=config.virtual_capital),
+            # Register additional strategies here, one class per file.
+        ]
+
+    # ------------------------------------------------------------------ #
+    # Scheduled jobs
+    # ------------------------------------------------------------------ #
+    def job_morning_setup(self) -> None:
+        logger.info("=== JOB: morning setup ===")
+        self._market_data.morning_setup()
+
+    def job_market_open(self, stream: bool = True) -> None:
+        logger.info("=== JOB: market open ===")
+        if not self._market_data.capture_open_snapshot():
+            logger.warning("Market appears closed today; skipping the session")
             return
+        self._dispatch(lambda s: s.on_market_open(), "on_market_open")
+        if stream:
+            self._market_data.start_streaming()
 
-        params = parse_qs(parsed.query)
-        self.server.request_token = params.get("request_token", [None])[0]
-        self.server.login_status = params.get("status", ["unknown"])[0]
-        self.server.callback_received = True
-        message = (
-            "Login complete. You can close this tab."
-            if self.server.request_token and self.server.login_status == "success"
-            else "Login was not completed. Return to the terminal for details."
+    def job_market_close(self) -> None:
+        logger.info("=== JOB: market close ===")
+        self._market_data.stop_streaming()
+        if not self._market_data.capture_close_snapshot():
+            logger.warning("No closing data captured (holiday?)")
+            return
+        self._dispatch(lambda s: s.on_market_close(), "on_market_close")
+
+    # ------------------------------------------------------------------ #
+    # Dispatch with per-strategy error isolation
+    # ------------------------------------------------------------------ #
+    def _dispatch(self, hook: Callable[[BaseStrategy], None], label: str) -> None:
+        for strategy in self._strategies:
+            try:
+                hook(strategy)
+            except Exception:  # noqa: BLE001 - a faulty strategy must not stop the bot
+                logger.bind(strategy=strategy.name).exception("{} raised", label)
+
+    def _on_ticks(self, ticks: list[dict[str, Any]]) -> None:
+        self._dispatch(lambda s: s.on_tick(ticks), "on_tick")
+
+    # ------------------------------------------------------------------ #
+    # Scheduling
+    # ------------------------------------------------------------------ #
+    def _add_cron(self, job_id: str, func: Callable[[], None], at: time, second: int = 0) -> None:
+        trigger = CronTrigger(
+            day_of_week="mon-fri",
+            hour=at.hour,
+            minute=at.minute,
+            second=second,
+            timezone=self._config.timezone,
         )
-        self.send_response(200 if self.server.request_token else 400)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(message.encode("utf-8"))
+        self._scheduler.add_job(
+            func,
+            trigger,
+            id=job_id,
+            name=job_id,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=300,
+            replace_existing=True,
+        )
 
-    def log_message(self, format, *args):
-        return
+    def _schedule_jobs(self) -> None:
+        c = self._config
+        self._add_cron("morning_setup", self.job_morning_setup, c.morning_setup_time)
+        self._add_cron("market_open", self.job_market_open, c.market_open_time, c.open_snapshot_delay_seconds)
+        self._add_cron("market_close", self.job_market_close, c.market_close_time, c.close_snapshot_delay_seconds)
+
+    def _on_job_event(self, event: JobExecutionEvent) -> None:
+        if event.code == EVENT_JOB_MISSED:
+            logger.warning("Job {} missed its scheduled run time", event.job_id)
+        else:
+            logger.opt(exception=event.exception).error("Job {} failed", event.job_id)
+
+    def _catch_up_if_late(self) -> None:
+        """If started mid-session on a weekday, run the jobs that were missed."""
+        c = self._config
+        now = datetime.now(c.timezone)
+        if now.weekday() >= 5 or not (c.morning_setup_time <= now.time() < c.market_close_time):
+            return
+        logger.info("Started inside today's session window; catching up on missed jobs")
+        self.job_morning_setup()
+        if now.time() >= c.market_open_time:
+            self.job_market_open()
+
+    # ------------------------------------------------------------------ #
+    # Run modes
+    # ------------------------------------------------------------------ #
+    def run(self) -> None:
+        self._market_data.add_tick_listener(self._on_ticks)
+        self._market_data.verify_connection()  # fail fast on a stale token
+        self._schedule_jobs()
+        self._scheduler.add_listener(self._on_job_event, EVENT_JOB_ERROR | EVENT_JOB_MISSED)
+        self._install_signal_handlers()
+        self._catch_up_if_late()
+
+        logger.info("Scheduler started (timezone {}). Press Ctrl+C to stop.", self._config.timezone)
+        try:
+            self._scheduler.start()
+        except (KeyboardInterrupt, SystemExit):
+            pass
+        finally:
+            self.shutdown()
+
+    def run_once(self, job: str) -> None:
+        self._market_data.add_tick_listener(self._on_ticks)
+        if job == "morning":
+            self.job_morning_setup()
+        elif job == "open":
+            self.job_market_open(stream=False)
+        elif job == "close":
+            self.job_market_close()
+
+    def shutdown(self) -> None:
+        logger.info("Shutting down")
+        self._market_data.stop_streaming()
+
+    def _install_signal_handlers(self) -> None:
+        def handler(signum: int, _frame: FrameType | None) -> None:
+            logger.info("Received signal {}; stopping scheduler", signum)
+            if self._scheduler.running:
+                self._scheduler.shutdown(wait=False)
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, handler)
 
 
-def main() -> None:
-    load_env_file(Path(__file__).with_name(".env"))
-    api_key = os.environ.get("KITE_API_KEY")
-    api_secret = os.environ.get("KITE_API_SECRET")
-    redirect_url = os.environ.get("KITE_REDIRECT_URL", "http://127.0.0.1:8765/")
+# ---------------------------------------------------------------------- #
+def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Automated algo trading bot (paper trading)")
+    parser.add_argument("--run-once", choices=["morning", "open", "close"], help="run one job immediately and exit")
+    return parser.parse_args(argv)
 
-    if not api_key or not api_secret:
-        raise SystemExit("Set KITE_API_KEY and KITE_API_SECRET in the .env file.")
 
-    callback = urlparse(redirect_url)
-    if callback.scheme != "http" or callback.hostname not in ("127.0.0.1", "localhost"):
-        raise SystemExit("KITE_REDIRECT_URL must be an HTTP localhost URL.")
-    port = callback.port or 80
-
-    kite = KiteConnect(api_key=api_key)
-    server = HTTPServer((callback.hostname, port), RequestTokenHandler)
-    server.callback = callback
-    server.callback_received = False
-    server.request_token = None
-    server.login_status = None
-    server.timeout = 300
-
-    login_url = kite.login_url()
-    print("Opening Kite's official login page. Sign in there and enter your MPIN when prompted.")
-    print("If it does not open automatically, visit:", login_url)
-    print("Waiting up to five minutes for the configured localhost redirect...")
-    webbrowser.open(login_url)
-
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
     try:
-        server.handle_request()
-    finally:
-        server.server_close()
+        config = AppConfig.load()
+    except ConfigError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
 
-    if not server.callback_received:
-        raise SystemExit("Timed out waiting for the login redirect.")
-    if server.login_status != "success" or not server.request_token:
-        raise SystemExit(f"Kite login did not succeed (status: {server.login_status}).")
-
-    session = kite.generate_session(server.request_token, api_secret=api_secret)
-    access_token = session["access_token"]
-    kite.set_access_token(access_token)
-    profile = kite.profile()
-
-    os.environ["ACCESS_TOKEN"] = access_token
-    print(f"Login successful. Connected as {profile['user_name']} ({profile['user_id']}).")
-    print(f"Access token saved to ACCESS_TOKEN env.")
+    setup_logging(config)
+    try:
+        bot = TradingBot(config)
+        if args.run_once:
+            bot.run_once(args.run_once)
+        else:
+            bot.run()
+    except AuthenticationError as exc:
+        logger.error("Authentication problem: {}", exc)
+        return 1
+    except MarketDataError as exc:
+        logger.error("Market data problem: {}", exc)
+        return 1
+    except Exception:  # noqa: BLE001
+        logger.exception("Fatal error")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
