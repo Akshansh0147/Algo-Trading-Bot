@@ -1,0 +1,3 @@
+2026-10-31 19:25:46 | ERROR    | - | __main__:main:213 - Authentication problem: Access token is invalid or expired. Re-run login.py to refresh it.
+2026-10-31 19:31:49 | ERROR    | - | __main__:main:213 - Authentication problem: Access token is invalid or expired. Re-run login.py to refresh it.
+2026-10-31 19:32:46 | ERROR    | - | __main__:main:213 - Authentication problem: Access token is invalid or expired. Re-run login.py to refresh it.

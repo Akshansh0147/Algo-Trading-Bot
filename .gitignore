@@ -1,4 +1,5 @@
 .env
 venv/
+logs/
 access_token.txt
 __pycache__/
